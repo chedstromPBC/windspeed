@@ -109,7 +109,7 @@ def process_data(df, start_hour, end_hour, location_name, start_date, end_date):
         early_hours[hour_mask].astype(int), unit="D"
     )
 
-    # Wind direction
+    # Wind direction vectors
     filtered["wind_dir_rad"] = np.radians(filtered["wind_dir_deg"])
     filtered["wind_u"] = np.sin(filtered["wind_dir_rad"])
     filtered["wind_v"] = np.cos(filtered["wind_dir_rad"])
@@ -117,40 +117,26 @@ def process_data(df, start_hour, end_hour, location_name, start_date, end_date):
     grouped = filtered.groupby("night_of")
 
     # ── HOURLY DATA (Priority) ──
-    # Wind speed as separate columns per hour
-    speed_pivot = filtered.sort_values("datetime").pivot_table(
-        index="night_of",
-        columns="hour",
-        values="wind_speed_mph",
-        aggfunc="first"
-    ).reset_index()
+    # Build hourly columns manually to avoid NaN issues
+    hourly_data_list = []
+    valid_hours = sorted([h for h in filtered["hour"].unique() if not pd.isna(h)])
     
-    # Rename columns safely, handling NaN
-    speed_pivot.columns = [f"wind_speed_{int(col):02d}" if not pd.isna(col) and isinstance(col, (int, float)) else col 
-                           for col in speed_pivot.columns]
+    for night, night_group in grouped:
+        row = {"night_of": night}
+        for hour in valid_hours:
+            hour_data = night_group[night_group["hour"] == hour]
+            if not hour_data.empty:
+                speed = hour_data["wind_speed_mph"].iloc[0]
+                direction = hour_data["wind_dir_deg"].iloc[0]
+                
+                if not pd.isna(speed):
+                    row[f"wind_speed_{int(hour):02d}"] = round(speed, 1)
+                if not pd.isna(direction):
+                    row[f"wind_dir_{int(hour):02d}"] = round(direction, 1)
+                    row[f"wind_compass_{int(hour):02d}"] = deg_to_compass(direction)
+        hourly_data_list.append(row)
     
-    # Wind direction as separate columns per hour
-    dir_pivot = filtered.sort_values("datetime").pivot_table(
-        index="night_of",
-        columns="hour",
-        values="wind_dir_deg",
-        aggfunc="first"
-    ).reset_index()
-    
-    dir_pivot.columns = [f"wind_dir_{int(col):02d}" if not pd.isna(col) and isinstance(col, (int, float)) else col 
-                         for col in dir_pivot.columns]
-    
-    # Compass direction for each hour
-    compass_data = []
-    for hour in sorted(filtered["hour"].unique()):
-        hour_data = filtered[filtered["hour"] == hour]
-        if not hour_data.empty:
-            avg_dir = avg_wind_dir(hour_data)
-            compass = deg_to_compass(avg_dir)
-            compass_data.append({
-                "night_of": None,  # Will be filled in merge
-                f"wind_compass_{hour:02d}": compass
-            })
+    hourly_df = pd.DataFrame(hourly_data_list)
     
     # ── NIGHTLY AVERAGES (Secondary) ──
     agg = grouped.agg(
@@ -165,40 +151,15 @@ def process_data(df, start_hour, end_hour, location_name, start_date, end_date):
     agg["avg_wind_dir_compass"] = agg["avg_wind_dir_deg"].apply(deg_to_compass)
     
     # Merge hourly data
-    agg = agg.merge(speed_pivot, on="night_of", how="left")
-    agg = agg.merge(dir_pivot, on="night_of", how="left")
-    
-    # Build compass columns for display
-    compass_dict = {}
-    for hour in sorted(filtered["hour"].unique()):
-        hour_data = filtered[filtered["hour"] == hour]
-        if not hour_data.empty:
-            avg_dir = avg_wind_dir(hour_data)
-            compass = deg_to_compass(avg_dir)
-            for night in agg["night_of"]:
-                hour_vals = filtered[(filtered["night_of"] == night) & (filtered["hour"] == hour)]
-                if not hour_vals.empty:
-                    compass_dict[(night, hour)] = hour_vals["wind_dir_deg"].iloc[0]
-    
-    # Add compass direction from direction values
-    for col in agg.columns:
-        if col.startswith("wind_dir_"):
-            hour_num = int(col.split("_")[-1])
-            compass_col = f"wind_compass_{hour_num:02d}"
-            agg[compass_col] = agg[col].apply(deg_to_compass)
+    agg = agg.merge(hourly_df, on="night_of", how="left")
 
-    # Column order: nightly summary first, then hourly
+    # Column order
     col_order = ["night_of", "avg_wind_speed_mph", "avg_wind_dir_deg", "avg_wind_dir_compass"]
     
-    # Add hourly wind speed columns
-    speed_cols = sorted([c for c in agg.columns if c.startswith("wind_speed_")])
-    col_order.extend(speed_cols)
-    
-    # Add hourly wind direction columns with compass
-    dir_cols = sorted([c for c in agg.columns if c.startswith("wind_dir_")])
-    compass_cols = sorted([c for c in agg.columns if c.startswith("wind_compass_")])
-    for dc, cc in zip(dir_cols, compass_cols):
-        col_order.extend([dc, cc])
+    # Add hourly columns in order
+    for col in sorted(hourly_df.columns):
+        if col != "night_of":
+            col_order.append(col)
     
     agg = agg[[c for c in col_order if c in agg.columns]]
 
