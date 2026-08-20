@@ -1,18 +1,19 @@
 """
-Wind Speed Tracker — Streamlit web app
-Fetches hourly weather from Open-Meteo and computes averages.
+Wind Data Averager — Streamlit web app
+Fetches hourly wind data from Open-Meteo with hourly detail as priority.
 """
 
 import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+import time
+from datetime import datetime
 from io import StringIO
 
 # ── Config ──
-st.set_page_config(page_title="Wind Speed Tracker", layout="wide")
-st.title("Weather Data Averager")
+st.set_page_config(page_title="Wind Data Averager", layout="wide")
+st.title("Wind Data Averager")
 
 # ── Helper functions ──
 
@@ -38,8 +39,6 @@ def fmt_hour(h):
     return f"{h % 12 or 12} {'AM' if h < 12 else 'PM'}"
 
 
-import time
-
 @st.cache_data(ttl=3600)
 def fetch_openmeteo(lat, lon, start_date, end_date):
     """Fetch Open-Meteo data with retry logic for rate limits."""
@@ -55,14 +54,10 @@ def fetch_openmeteo(lat, lon, start_date, end_date):
                 "start_date": start_date,
                 "end_date": end_date,
                 "hourly": ",".join([
-                    "temperature_2m",
                     "wind_speed_10m",
                     "wind_direction_10m",
-                    "rain",
                 ]),
-                "temperature_unit": "fahrenheit",
                 "wind_speed_unit": "mph",
-                "precipitation_unit": "inch",
                 "timezone": "America/Los_Angeles",
             }
 
@@ -73,10 +68,8 @@ def fetch_openmeteo(lat, lon, start_date, end_date):
             hourly = data["hourly"]
             df = pd.DataFrame({
                 "datetime": pd.to_datetime(hourly["time"]),
-                "temp_f": hourly["temperature_2m"],
                 "wind_speed_mph": hourly["wind_speed_10m"],
                 "wind_dir_deg": hourly["wind_direction_10m"],
-                "rain_in": hourly["rain"],
             })
 
             df["hour"] = df["datetime"].dt.hour
@@ -88,13 +81,13 @@ def fetch_openmeteo(lat, lon, start_date, end_date):
             if e.response.status_code == 429:
                 if attempt < max_retries - 1:
                     time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
+                    retry_delay *= 2
                     continue
             raise
 
 
-def process_data(df, start_hour, end_hour, location_name, start_date, end_date, source):
-    """Process hourly data into nightly averages."""
+def process_data(df, start_hour, end_hour, location_name, start_date, end_date):
+    """Process hourly data with hourly detail as priority."""
     
     if df.empty:
         return None, "No data to process."
@@ -123,77 +116,116 @@ def process_data(df, start_hour, end_hour, location_name, start_date, end_date, 
 
     grouped = filtered.groupby("night_of")
 
-    # Aggregate
-    agg = grouped.agg(
-        avg_temp_f=("temp_f", "mean"),
-        avg_wind_mph=("wind_speed_mph", "mean"),
-        total_rain_in=("rain_in", "sum"),
+    # ── HOURLY DATA (Priority) ──
+    # Wind speed as separate columns per hour
+    speed_pivot = filtered.sort_values("datetime").pivot_table(
+        index="night_of",
+        columns="hour",
+        values="wind_speed_mph",
+        aggfunc="first"
     ).reset_index()
-
-    # Round
-    for col in agg.columns:
-        if col.startswith("avg_") or col.startswith("total_"):
-            agg[col] = agg[col].round(1)
-
-    # Wind direction (vector average)
+    
+    # Rename columns safely, handling NaN
+    speed_pivot.columns = [f"wind_speed_{int(col):02d}" if not pd.isna(col) and isinstance(col, (int, float)) else col 
+                           for col in speed_pivot.columns]
+    
+    # Wind direction as separate columns per hour
+    dir_pivot = filtered.sort_values("datetime").pivot_table(
+        index="night_of",
+        columns="hour",
+        values="wind_dir_deg",
+        aggfunc="first"
+    ).reset_index()
+    
+    dir_pivot.columns = [f"wind_dir_{int(col):02d}" if not pd.isna(col) and isinstance(col, (int, float)) else col 
+                         for col in dir_pivot.columns]
+    
+    # Compass direction for each hour
+    compass_data = []
+    for hour in sorted(filtered["hour"].unique()):
+        hour_data = filtered[filtered["hour"] == hour]
+        if not hour_data.empty:
+            avg_dir = avg_wind_dir(hour_data)
+            compass = deg_to_compass(avg_dir)
+            compass_data.append({
+                "night_of": None,  # Will be filled in merge
+                f"wind_compass_{hour:02d}": compass
+            })
+    
+    # ── NIGHTLY AVERAGES (Secondary) ──
+    agg = grouped.agg(
+        avg_wind_speed_mph=("wind_speed_mph", "mean"),
+    ).reset_index()
+    agg["avg_wind_speed_mph"] = agg["avg_wind_speed_mph"].round(1)
+    
+    # Vector-averaged wind direction
     wind_dirs = grouped.apply(avg_wind_dir).reset_index()
     wind_dirs.columns = ["night_of", "avg_wind_dir_deg"]
     agg = agg.merge(wind_dirs, on="night_of")
     agg["avg_wind_dir_compass"] = agg["avg_wind_dir_deg"].apply(deg_to_compass)
+    
+    # Merge hourly data
+    agg = agg.merge(speed_pivot, on="night_of", how="left")
+    agg = agg.merge(dir_pivot, on="night_of", how="left")
+    
+    # Build compass columns for display
+    compass_dict = {}
+    for hour in sorted(filtered["hour"].unique()):
+        hour_data = filtered[filtered["hour"] == hour]
+        if not hour_data.empty:
+            avg_dir = avg_wind_dir(hour_data)
+            compass = deg_to_compass(avg_dir)
+            for night in agg["night_of"]:
+                hour_vals = filtered[(filtered["night_of"] == night) & (filtered["hour"] == hour)]
+                if not hour_vals.empty:
+                    compass_dict[(night, hour)] = hour_vals["wind_dir_deg"].iloc[0]
+    
+    # Add compass direction from direction values
+    for col in agg.columns:
+        if col.startswith("wind_dir_"):
+            hour_num = int(col.split("_")[-1])
+            compass_col = f"wind_compass_{hour_num:02d}"
+            agg[compass_col] = agg[col].apply(deg_to_compass)
 
-    # Hourly temps as separate columns
-    hourly_pivot = filtered.sort_values("datetime").pivot_table(
-        index="night_of",
-        columns="hour",
-        values="temp_f",
-        aggfunc="first"
-    ).reset_index()
+    # Column order: nightly summary first, then hourly
+    col_order = ["night_of", "avg_wind_speed_mph", "avg_wind_dir_deg", "avg_wind_dir_compass"]
     
-    # Flatten column names
-    hourly_pivot.columns = [f"temp_f_{col:02d}" if isinstance(col, int) else col 
-                            for col in hourly_pivot.columns]
+    # Add hourly wind speed columns
+    speed_cols = sorted([c for c in agg.columns if c.startswith("wind_speed_")])
+    col_order.extend(speed_cols)
     
-    agg = agg.merge(hourly_pivot, on="night_of", how="left")
-
-    # Column order for display
-    col_order = [
-        "night_of", "avg_temp_f", "avg_wind_mph", "avg_wind_dir_deg",
-        "avg_wind_dir_compass", "total_rain_in",
-    ]
-    
-    # Add hourly temp columns in order
-    hourly_cols = sorted([c for c in agg.columns if c.startswith("temp_f_")])
-    col_order.extend(hourly_cols)
+    # Add hourly wind direction columns with compass
+    dir_cols = sorted([c for c in agg.columns if c.startswith("wind_dir_")])
+    compass_cols = sorted([c for c in agg.columns if c.startswith("wind_compass_")])
+    for dc, cc in zip(dir_cols, compass_cols):
+        col_order.extend([dc, cc])
     
     agg = agg[[c for c in col_order if c in agg.columns]]
 
     # Summary stats
     fmt_s = fmt_hour(start_hour)
     fmt_e = fmt_hour(end_hour)
-    overall_temp = agg["avg_temp_f"].mean()
-    max_row = agg.loc[agg["avg_temp_f"].idxmax()]
-    min_row = agg.loc[agg["avg_temp_f"].idxmin()]
-    total_rain = agg["total_rain_in"].sum()
+    avg_wind = agg["avg_wind_speed_mph"].mean()
+    max_wind = agg["avg_wind_speed_mph"].max()
+    min_wind = agg["avg_wind_speed_mph"].min()
 
-    # Build CSV in memory
+    # Build CSV
     access_date = datetime.now().strftime("%Y-%m-%d %H:%M")
     safe_name = location_name.lower().replace(" ", "_").replace(",", "")
     date_s = start_date.replace("-", "_")
     date_e = end_date.replace("-", "_")
-    filename = f"{safe_name}_weather_{date_s}_to_{date_e}.csv"
+    filename = f"{safe_name}_wind_{date_s}_to_{date_e}.csv"
 
     csv_header = (
-        f"# {location_name} weather summary\n"
-        f"# Source: {source}\n"
+        f"# {location_name} wind summary\n"
+        f"# Source: Open-Meteo archive API (open-meteo.com)\n"
         f"# Date range: {start_date} to {end_date}\n"
         f"# Hours averaged: {fmt_s} to {fmt_e} (America/Los_Angeles)\n"
         f"# Data accessed: {access_date}\n"
-        f"# Overall mean temp: {overall_temp:.1f} F / {((overall_temp - 32) * 5/9):.1f} C\n"
-        f"# Warmest night: {max_row['avg_temp_f']} F on {max_row['night_of']}\n"
-        f"# Coldest night: {min_row['avg_temp_f']} F on {min_row['night_of']}\n"
-        f"# Total rainfall: {total_rain:.3f} in\n"
+        f"# Average wind speed: {avg_wind:.1f} mph\n"
+        f"# Max nightly avg: {max_wind:.1f} mph\n"
+        f"# Min nightly avg: {min_wind:.1f} mph\n"
         f"# Wind direction averaged using vector (sin/cos) method\n"
-        f"# Rain is TOTAL per period (not average)\n"
         f"#\n"
     )
 
@@ -204,10 +236,9 @@ def process_data(df, start_hour, end_hour, location_name, start_date, end_date, 
 
     return {
         "agg": agg,
-        "overall_temp": overall_temp,
-        "max_row": max_row,
-        "min_row": min_row,
-        "total_rain": total_rain,
+        "avg_wind": avg_wind,
+        "max_wind": max_wind,
+        "min_wind": min_wind,
         "fmt_s": fmt_s,
         "fmt_e": fmt_e,
         "csv_content": csv_content,
@@ -234,8 +265,7 @@ if st.button("Fetch Data", type="primary"):
             df = fetch_openmeteo(lat, lon, start_date.strftime("%Y-%m-%d"), end_date.strftime("%Y-%m-%d"))
             result, error = process_data(df, start_hour, end_hour, location_name, 
                                         start_date.strftime("%Y-%m-%d"), 
-                                        end_date.strftime("%Y-%m-%d"),
-                                        "Open-Meteo archive API")
+                                        end_date.strftime("%Y-%m-%d"))
             
             if error:
                 st.error(error)
@@ -243,23 +273,33 @@ if st.button("Fetch Data", type="primary"):
                 agg = result["agg"]
                 
                 # Summary stats
-                st.subheader(f"Weather Averages ({result['fmt_s']} – {result['fmt_e']}), {location_name}")
+                st.subheader(f"Wind Data ({result['fmt_s']} – {result['fmt_e']}), {location_name}")
                 
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Overall Mean Temp", f"{result['overall_temp']:.1f} °F")
-                col2.metric("Warmest Night", f"{result['max_row']['avg_temp_f']} °F")
-                col3.metric("Coldest Night", f"{result['min_row']['avg_temp_f']} °F")
-                col4.metric("Total Rainfall", f"{result['total_rain']:.3f} in")
+                col1, col2, col3 = st.columns(3)
+                col1.metric("Average Wind Speed", f"{result['avg_wind']:.1f} mph")
+                col2.metric("Highest Nightly Avg", f"{result['max_wind']:.1f} mph")
+                col3.metric("Lowest Nightly Avg", f"{result['min_wind']:.1f} mph")
                 
-                # Data table
+                # Hourly data table (priority)
+                st.subheader("Hourly Wind Speed (mph)")
+                speed_cols = ["night_of"] + sorted([c for c in agg.columns if c.startswith("wind_speed_")])
+                st.dataframe(agg[speed_cols], use_container_width=True, hide_index=True)
+                
+                st.subheader("Hourly Wind Direction (degrees & compass)")
+                dir_compass_cols = ["night_of"]
+                for col in sorted(agg.columns):
+                    if col.startswith("wind_dir_"):
+                        dir_compass_cols.append(col)
+                        hour_num = col.split("_")[-1]
+                        compass_col = f"wind_compass_{hour_num}"
+                        if compass_col in agg.columns:
+                            dir_compass_cols.append(compass_col)
+                st.dataframe(agg[dir_compass_cols], use_container_width=True, hide_index=True)
+                
+                # Nightly summary
                 st.subheader("Nightly Averages")
-                display_cols = [c for c in agg.columns if not c.startswith("temp_f_")]
-                st.dataframe(agg[display_cols], use_container_width=True, hide_index=True)
-                
-                # Hourly temps table
-                st.subheader("Hourly Temperatures (°F)")
-                hourly_cols = ["night_of"] + sorted([c for c in agg.columns if c.startswith("temp_f_")])
-                st.dataframe(agg[hourly_cols], use_container_width=True, hide_index=True)
+                nightly_cols = ["night_of", "avg_wind_speed_mph", "avg_wind_dir_deg", "avg_wind_dir_compass"]
+                st.dataframe(agg[nightly_cols], use_container_width=True, hide_index=True)
                 
                 # Download button
                 st.download_button(
